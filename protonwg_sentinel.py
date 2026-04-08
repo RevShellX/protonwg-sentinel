@@ -31,8 +31,8 @@ GitHub: https://github.com/YOUR_USERNAME/protonwg-sentinel
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import ipaddress, json, platform, random, signal, socket
-import string, subprocess, sys, termios, threading, time, tty
+import ipaddress, json, platform, random, re, shutil, signal, socket
+import string, subprocess, sys, termios, threading, time, tty, unicodedata
 import urllib.request
 from datetime import datetime, timezone
 
@@ -44,7 +44,11 @@ COMPACT_INTERVAL = 5          # seconds between compact status refreshes
 FULL_INTERVAL    = 60         # seconds between automatic full re-checks
 HTTP_TIMEOUT     = 6
 DNS_TIMEOUT      = 8
-W                = 72         # display width
+W                = 72         # display width (fallback when terminal width unavailable)
+MIN_WIDTH        = 72         # minimum terminal width used by _tw()
+MAX_WIDTH        = 120        # maximum terminal width used by _tw()
+TERM_MARGIN      = 2          # columns to subtract from raw terminal width in _tw()
+BOX_PADDING      = 2          # spaces between box border and content in _box_row()
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── ProtonVPN ASN database ─────────────────────────────────────────────────────
@@ -81,18 +85,65 @@ PROTON_INTERNAL_RANGES = [
 ]
 
 # ── ANSI ───────────────────────────────────────────────────────────────────────
-RST    = "\033[0m"
-BOLD   = "\033[1m"
-DIM    = "\033[2m"
-RED    = "\033[91m"
-ORANGE = "\033[38;5;208m"
-YELLOW = "\033[93m"
-GREEN  = "\033[92m"
-CYAN   = "\033[96m"
-BG_GRN = "\033[42m"
-BG_RED = "\033[41m"
-BG_YLW = "\033[43m"
-BLACK  = "\033[30m"
+RST     = "\033[0m"
+BOLD    = "\033[1m"
+DIM     = "\033[2m"
+ITALIC  = "\033[3m"
+RED     = "\033[91m"
+ORANGE  = "\033[38;5;208m"
+YELLOW  = "\033[93m"
+GREEN   = "\033[92m"
+CYAN    = "\033[96m"
+BLUE    = "\033[94m"
+MAGENTA = "\033[95m"
+WHITE   = "\033[97m"
+PURPLE  = "\033[38;5;141m"
+TEAL    = "\033[38;5;43m"
+GOLD    = "\033[38;5;220m"
+BG_BLK  = "\033[40m"
+BLACK   = "\033[30m"
+
+# ── Terminal helpers ────────────────────────────────────────────────────────────
+_ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mKJH]')
+
+
+def _vis(s):
+    """Visible column width of *s*, ignoring ANSI codes (handles wide/emoji chars)."""
+    clean = _ANSI_RE.sub('', s)
+    return sum(
+        2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
+        for c in clean
+    )
+
+
+def _tw():
+    """Terminal width, clamped to MIN_WIDTH–MAX_WIDTH columns.
+    Falls back to W (the configured display width) if size cannot be queried."""
+    try:
+        return max(MIN_WIDTH, min(shutil.get_terminal_size().columns - TERM_MARGIN, MAX_WIDTH))
+    except Exception:
+        return W
+
+
+def _box_row(content, inner, border_color=CYAN):
+    """Return a box content row: ║  <content><padding>  ║
+    inner = total inner width (box width minus the two border chars).
+    BOX_PADDING spaces are added on each side of the content."""
+    pad = max(0, inner - BOX_PADDING - _vis(content))
+    return (f"{border_color}{BOLD}║{RST}  {content}"
+            f"{' ' * pad}  {border_color}{BOLD}║{RST}")
+
+
+def _box_top(inner, border_color=CYAN):
+    return f"{border_color}{BOLD}╔{'═' * inner}╗{RST}"
+
+
+def _box_mid(inner, border_color=CYAN):
+    return f"{border_color}{BOLD}╠{'═' * inner}╣{RST}"
+
+
+def _box_bot(inner, border_color=CYAN):
+    return f"{border_color}{BOLD}╚{'═' * inner}╝{RST}"
 
 # ── Shared state ───────────────────────────────────────────────────────────────
 _force_full = threading.Event()
@@ -118,13 +169,13 @@ def fmt_dur(s):
 
 def row(label, value, color=RST, indent=0):
     pad = "    " * indent
-    print(f"{pad}  {BOLD}{label:<22}{RST} {color}{value}{RST}")
+    print(f"{pad}  {DIM}▸{RST}  {BOLD}{label:<22}{RST}  {color}{value}{RST}")
 
 
 def section(title):
-    print(f"\n{DIM}{'─' * W}{RST}")
-    print(f"  {BOLD}{CYAN}{title}{RST}")
-    print(f"{DIM}{'─' * W}{RST}")
+    w = _tw()
+    fill = max(4, w - _vis(title) - 8)
+    print(f"\n  {BOLD}{CYAN}┌─{RST}  {BOLD}{title}{RST}  {DIM}{'─' * fill}{RST}")
 
 
 def asn_code(field):
@@ -482,11 +533,19 @@ def render_full(sys_info, wg, ping_r, routing, ks,
 
     print("\033[2J\033[H", end="")
     utc, loc = now_str()
+    w     = _tw()
+    inner = w - 4
 
-    print(f"\n{BOLD}{GREEN}{'═' * W}{RST}")
-    print(f"  {BOLD}protonwg-sentinel  v5.0{RST}   {DIM}{utc}  /  {loc}{RST}")
-    print(f"{BOLD}{GREEN}{'═' * W}{RST}")
-    print(f"  {DIM}Press {BOLD}Enter{RST}{DIM} for a fresh full report  |  Ctrl-C to quit{RST}")
+    # ── Header box ─────────────────────────────────────────────────────────────
+    t1 = f"{BOLD}✦  protonwg-sentinel{RST}  {DIM}v5.0{RST}"
+    t2 = f"{DIM}{utc}  ·  {loc}{RST}"
+    t3 = f"{DIM}Press {BOLD}Enter{RST}{DIM} for a fresh full report   ·   Ctrl-C to quit{RST}"
+    print(f"\n{_box_top(inner)}")
+    print(_box_row(t1, inner))
+    print(_box_row(t2, inner))
+    print(_box_mid(inner))
+    print(_box_row(t3, inner))
+    print(f"{_box_bot(inner)}")
 
     # ── System ─────────────────────────────────────────────────────────────────
     section("🖥   SYSTEM")
@@ -609,9 +668,9 @@ def render_full(sys_info, wg, ping_r, routing, ks,
     print(f"\n  {DIM}Manual check: https://www.dnsleaktest.com → Extended Test{RST}")
 
     # ── Footer ─────────────────────────────────────────────────────────────────
-    print(f"\n{DIM}{'─' * W}")
-    print(f"  Switching to compact status in 3s…  |  "
-          f"Press Enter to repeat this report{RST}\n")
+    print(f"\n{DIM}{'─' * w}{RST}")
+    print(f"  {DIM}Switching to compact status in {BOLD}3s{RST}{DIM}…   "
+          f"Press {BOLD}Enter{RST}{DIM} to repeat this report{RST}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -621,11 +680,13 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
                    proton, vpn_asn, std, adv, last_full_utc, next_full_in):
     """
     Single-screen status dashboard.
-    Large coloured banner at the top — green, yellow, or red.
+    Full-width boxed banner at the top — green, yellow, or red.
     Individual indicator lines below for every check.
     """
     print("\033[2J\033[H", end="")
     utc, loc = now_str()
+    w     = _tw()
+    inner = w - 4
 
     lvl       = wg["level"]
     route_ok  = routing["default_via_vpn"]
@@ -638,28 +699,32 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
     any_red   = (lvl in ("dead", "never", "error") or not route_ok or dns_leak)
 
     if all_green:
-        bg, fg      = BG_GRN, BLACK
-        banner_txt  = " ✅  CONNECTED — ProtonVPN tunnel healthy "
+        bdr_c      = GREEN
+        banner_txt = f"{BOLD}  ✅  CONNECTED  —  ProtonVPN WireGuard tunnel is healthy  ✓{RST}"
     elif any_red:
-        bg, fg      = BG_RED, BLACK
-        banner_txt  = " ❌  WARNING — VPN issue detected "
+        bdr_c      = RED
+        banner_txt = f"{BOLD}  ❌  WARNING  —  VPN issue detected — check details below{RST}"
     else:
-        bg, fg      = BG_YLW, BLACK
-        banner_txt  = " ⚠️   DEGRADED — some checks need attention "
+        bdr_c      = YELLOW
+        banner_txt = f"{BOLD}  ⚠️   DEGRADED  —  some checks need attention{RST}"
 
-    pad = max(0, (W - len(banner_txt)) // 2)
-    print(f"\n{' ' * pad}{BOLD}{bg}{fg}{banner_txt}{RST}\n")
+    # Status banner box
+    print(f"\n{_box_top(inner, bdr_c)}")
+    print(_box_row(banner_txt, inner, bdr_c))
+    print(f"{_box_bot(inner, bdr_c)}")
 
-    print(f"  {DIM}{utc}  /  {loc}{RST}")
-    print(f"  {DIM}Last full report : {last_full_utc}{RST}")
-    print(f"  {DIM}Next auto-report : {next_full_in}s   "
-          f"│  Press {BOLD}Enter{RST}{DIM} for full report now  │  Ctrl-C to quit{RST}")
-    print(f"\n{DIM}{'─' * W}{RST}")
+    # Timestamps & hints
+    print(f"\n  {DIM}🕐  {utc}  ·  {loc}{RST}")
+    print(f"  {DIM}📋  Last full report: {BOLD}{last_full_utc}{RST}"
+          f"{DIM}   ·   Next auto-check in: {BOLD}{next_full_in}s{RST}")
+    print(f"  {DIM}⌨   Press {BOLD}Enter{RST}{DIM} for full report   ·   Ctrl-C to quit{RST}")
+
+    print(f"\n  {DIM}{'─' * (w - 4)}{RST}")
 
     # WireGuard
     wg_c  = GREEN if lvl == "ok" else (YELLOW if lvl == "stale" else RED)
     wg_ic = "✅" if lvl == "ok" else ("⚠️ " if lvl == "stale" else "❌")
-    print(f"  {wg_ic}  {BOLD}{'WireGuard':<20}{RST}  {wg_c}{wg['msg']}{RST}")
+    print(f"  {wg_ic}  {BOLD}{CYAN}{'WireGuard':<20}{RST}  {wg_c}{wg['msg']}{RST}")
 
     # Latency
     if ping_r["ok"]:
@@ -668,36 +733,36 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
             lat_c = GREEN if ms < 50 else YELLOW if ms < 120 else RED
         except ValueError:
             lat_c = DIM
-        print(f"  📡  {BOLD}{'Endpoint latency':<20}{RST}  "
+        print(f"  📡  {BOLD}{CYAN}{'Endpoint latency':<20}{RST}  "
               f"{lat_c}{ping_r['latency_ms']} ms{RST}  "
               f"{DIM}→ {ping_r['endpoint']}{RST}")
     else:
-        print(f"  📡  {BOLD}{'Endpoint latency':<20}{RST}  {DIM}{ping_r['msg']}{RST}")
+        print(f"  📡  {BOLD}{CYAN}{'Endpoint latency':<20}{RST}  {DIM}{ping_r['msg']}{RST}")
 
     # Exit IP
     ip_c = CYAN if ipv4 else RED
-    print(f"  🌐  {BOLD}{'Exit IPv4':<20}{RST}  {ip_c}{ipv4 or 'not detected'}{RST}")
+    print(f"  🌐  {BOLD}{CYAN}{'Exit IPv4':<20}{RST}  {ip_c}{ipv4 or 'not detected'}{RST}")
     if ipv6:
-        print(f"  🌐  {BOLD}{'Exit IPv6':<20}{RST}  {CYAN}{ipv6}{RST}")
+        print(f"  🌐  {BOLD}{CYAN}{'Exit IPv6':<20}{RST}  {CYAN}{ipv6}{RST}")
 
     # ProtonVPN ASN
     pc = (GREEN if proton["level"] == "owned"
           else ORANGE if proton["level"] == "partner" else RED)
     pi = ("✅" if proton["level"] == "owned"
           else "🟠" if proton["level"] == "partner" else "❌")
-    print(f"  {pi}  {BOLD}{'ProtonVPN ASN':<20}{RST}  {pc}{proton['msg']}{RST}")
+    print(f"  {pi}  {BOLD}{CYAN}{'ProtonVPN ASN':<20}{RST}  {pc}{proton['msg']}{RST}")
 
     # Default route
     r_ic  = "✅" if route_ok else "❌"
     r_c   = GREEN if route_ok else RED
     r_msg = (f"Default route via {INTERFACE} ✓" if route_ok
              else (routing["warning"] or f"Not routed via {INTERFACE}"))
-    print(f"  {r_ic}  {BOLD}{'Default route':<20}{RST}  {r_c}{r_msg}{RST}")
+    print(f"  {r_ic}  {BOLD}{CYAN}{'Default route':<20}{RST}  {r_c}{r_msg}{RST}")
 
     # Kill switch
     ks_ic = "✅" if ks["active"] else "⚠️ "
     ks_c  = GREEN if ks["active"] else YELLOW
-    print(f"  {ks_ic}  {BOLD}{'Kill switch':<20}{RST}  {ks_c}{ks['details']}{RST}")
+    print(f"  {ks_ic}  {BOLD}{CYAN}{'Kill switch':<20}{RST}  {ks_c}{ks['details']}{RST}")
 
     # DNS checks
     for label, lvl2, msg in (
@@ -706,9 +771,9 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
     ):
         d_ic = "✅" if lvl2 == "ok" else ("⚠️ " if lvl2 == "warn" else "❌")
         d_c  = GREEN if lvl2 == "ok" else (YELLOW if lvl2 == "warn" else RED)
-        print(f"  {d_ic}  {BOLD}{label:<20}{RST}  {d_c}{msg}{RST}")
+        print(f"  {d_ic}  {BOLD}{CYAN}{label:<20}{RST}  {d_c}{msg}{RST}")
 
-    print(f"{DIM}{'─' * W}{RST}\n")
+    print(f"  {DIM}{'─' * (w - 4)}{RST}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -749,11 +814,14 @@ def main():
 
     # ── Boot splash ────────────────────────────────────────────────────────────
     print("\033[2J\033[H", end="")
-    print(f"\n{BOLD}{GREEN}{'═' * W}{RST}")
-    print(f"  {BOLD}protonwg-sentinel  v5.0{RST}")
-    print(f"{BOLD}{GREEN}{'═' * W}{RST}\n")
-    print(f"  {DIM}Gathering data — fetching IPs, running DNS leak tests,{RST}")
-    print(f"  {DIM}pinging WireGuard endpoint…  (this takes ~10s){RST}\n")
+    w     = _tw()
+    inner = w - 4
+    t1 = f"{BOLD}✦  protonwg-sentinel{RST}  {DIM}v5.0{RST}"
+    print(f"\n{_box_top(inner)}")
+    print(_box_row(t1, inner))
+    print(f"{_box_bot(inner)}\n")
+    print(f"  {DIM}⏳  Gathering data — fetching IPs, running DNS leak tests,{RST}")
+    print(f"  {DIM}    pinging WireGuard endpoint…  (this takes ~10s){RST}\n")
 
     # ── Initial full data collection ───────────────────────────────────────────
     data          = collect_all()
@@ -789,7 +857,7 @@ def main():
             # ── Full re-check ──────────────────────────────────────────────────
             _force_full.clear()
             print("\033[2J\033[H", end="")
-            print(f"\n  {DIM}Re-fetching all network data…{RST}\n")
+            print(f"\n  {BOLD}{CYAN}↻{RST}  {DIM}Re-fetching all network data…{RST}\n")
             data          = collect_all()
             wg            = check_wg(INTERFACE)
             ping_r        = ping_wg_endpoint(INTERFACE)
