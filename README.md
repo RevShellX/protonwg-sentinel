@@ -50,8 +50,9 @@ sudo apt install iptables                # for kill-switch check
 ```
 
 The script uses only Python standard library modules:  
-`json`, `os`, `platform`, `random`, `signal`, `socket`, `string`, `subprocess`,  
-`sys`, `time`, `urllib.request`, `datetime`, `ipaddress`
+`ipaddress`, `json`, `os`, `platform`, `random`, `re`, `shutil`, `signal`,  
+`socket`, `string`, `subprocess`, `sys`, `termios`, `threading`, `time`,  
+`tty`, `unicodedata`, `urllib.request`, `datetime`
 
 ---
 

@@ -942,7 +942,7 @@ def log_connection(data, wg, proton, vpn_asn, std_status, adv_status):
     record = {
         "timestamp":    datetime.now(timezone.utc).isoformat(),
         "asn":          vpn_asn,
-        "provider":     ASN_LABELS.get(vpn_asn, (vpn_asn,))[0],
+        "provider":     ASN_LABELS.get(vpn_asn, (vpn_asn, "?"))[0],
         "proton_level": proton["level"],
         "ip":           data.get("ipv4"),
         "ipv6":         data.get("ipv6"),
