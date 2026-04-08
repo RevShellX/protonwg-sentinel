@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-protonwg-sentinel  v6.0
+protonwg-sentinel  v7.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WireGuard + ProtonVPN connection monitor — stdlib only, no pip needed
 
@@ -41,6 +41,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 # ── Configuration ──────────────────────────────────────────────────────────────
+VERSION          = "7.0"
 INTERFACE        = "Sweden"   # WireGuard interface name  (check: sudo wg show)
 STALE_WARN_SEC   = 150        # warn if handshake older than this (seconds)
 STALE_DEAD_SEC   = 300        # treat tunnel as dead beyond this
@@ -153,23 +154,35 @@ KNOWN_SAFE_DNS_IPS = {
 }
 
 # ── ANSI ───────────────────────────────────────────────────────────────────────
-RST     = "\033[0m"
-BOLD    = "\033[1m"
-DIM     = "\033[2m"
-ITALIC  = "\033[3m"
-RED     = "\033[91m"
-ORANGE  = "\033[38;5;208m"
-YELLOW  = "\033[93m"
-GREEN   = "\033[92m"
-CYAN    = "\033[96m"
-BLUE    = "\033[94m"
-MAGENTA = "\033[95m"
-WHITE   = "\033[97m"
-PURPLE  = "\033[38;5;141m"
-TEAL    = "\033[38;5;43m"
-GOLD    = "\033[38;5;220m"
-BG_BLK  = "\033[40m"
-BLACK   = "\033[30m"
+RST      = "\033[0m"
+BOLD     = "\033[1m"
+DIM      = "\033[2m"
+ITALIC   = "\033[3m"
+# Standard bright colours
+RED      = "\033[91m"
+YELLOW   = "\033[93m"
+GREEN    = "\033[92m"
+CYAN     = "\033[96m"
+BLUE     = "\033[94m"
+MAGENTA  = "\033[95m"
+WHITE    = "\033[97m"
+BLACK    = "\033[30m"
+# 256-colour extended palette — for depth and gradient-like transitions
+ORANGE   = "\033[38;5;208m"
+AMBER    = "\033[38;5;214m"   # warm amber — between yellow and orange
+GOLD     = "\033[38;5;220m"   # gold accent
+LIME     = "\033[38;5;154m"   # bright lime green
+MINT     = "\033[38;5;121m"   # soft mint
+TEAL     = "\033[38;5;43m"    # deep teal
+AQUA     = "\033[38;5;87m"    # bright aqua
+INDIGO   = "\033[38;5;105m"   # indigo / deep blue-purple
+PURPLE   = "\033[38;5;141m"   # medium purple
+LAVENDER = "\033[38;5;183m"   # light lavender
+ROSE     = "\033[38;5;204m"   # rose / soft red
+CORAL    = "\033[38;5;209m"   # coral — between red and orange
+SILVER   = "\033[38;5;250m"   # light silver-grey
+SMOKE    = "\033[38;5;240m"   # mid smoke-grey
+BG_BLK   = "\033[40m"
 
 # ── Terminal helpers ────────────────────────────────────────────────────────────
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[mKJH]')
@@ -213,6 +226,69 @@ def _box_mid(inner, border_color=CYAN):
 def _box_bot(inner, border_color=CYAN):
     return f"{border_color}{BOLD}╚{'═' * inner}╝{RST}"
 
+
+def _progress_bar(fraction: float, width: int = 24,
+                  fill_color: str = GREEN, empty_color: str = SMOKE) -> str:
+    """ASCII progress bar using block characters.
+    fraction = 0.0–1.0 ; width = number of cells."""
+    fraction = max(0.0, min(1.0, fraction))
+    filled   = round(fraction * width)
+    empty    = width - filled
+    return f"{fill_color}{'█' * filled}{RST}{empty_color}{'░' * empty}{RST}"
+
+
+def _latency_color(ms_str: str):
+    """Return a colour that transitions green→yellow→amber→orange→red with latency."""
+    try:
+        ms = float(ms_str)
+    except (ValueError, TypeError):
+        return DIM
+    if ms < 30:   return LIME
+    if ms < 60:   return GREEN
+    if ms < 100:  return GOLD
+    if ms < 150:  return AMBER
+    if ms < 200:  return ORANGE
+    return RED
+
+
+# ── Animated spinner (for data-collection phases) ──────────────────────────────
+class Spinner:
+    """
+    Draws a braille spinner in-place while a long operation runs.
+    Usage:
+        with Spinner("Gathering data…"):
+            do_slow_stuff()
+    The spinner auto-erases itself when the context exits.
+    """
+    _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, msg: str = ""):
+        self._msg  = msg
+        self._stop = threading.Event()
+        self._t: threading.Thread | None = None
+
+    def _spin(self):
+        i = 0
+        width = len(self._msg) + 8
+        while not self._stop.is_set():
+            frame = self._FRAMES[i % len(self._FRAMES)]
+            print(f"\r  {CYAN}{BOLD}{frame}{RST}  {DIM}{self._msg}{RST}",
+                  end="", flush=True)
+            i += 1
+            time.sleep(0.1)
+        # Erase the spinner line
+        print(f"\r{' ' * (width + 4)}\r", end="", flush=True)
+
+    def __enter__(self):
+        self._t = threading.Thread(target=self._spin, daemon=True)
+        self._t.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stop.set()
+        if self._t:
+            self._t.join(timeout=0.5)
+
 # ── Shared state ───────────────────────────────────────────────────────────────
 _force_full = threading.Event()
 _running    = True
@@ -237,13 +313,20 @@ def fmt_dur(s):
 
 def row(label, value, color=RST, indent=0):
     pad = "    " * indent
-    print(f"{pad}  {DIM}▸{RST}  {BOLD}{label:<22}{RST}  {color}{value}{RST}")
+    label_col = f"{BOLD}{SILVER}{label:<22}{RST}"
+    print(f"{pad}  {DIM}{TEAL}▸{RST}  {label_col}  {color}{value}{RST}")
 
 
-def section(title):
-    w = _tw()
-    fill = max(4, w - _vis(title) - 8)
-    print(f"\n  {BOLD}{CYAN}┌─{RST}  {BOLD}{title}{RST}  {DIM}{'─' * fill}{RST}")
+def section(title, icon=""):
+    """Print a visually distinct section header with accent styling."""
+    w       = _tw()
+    prefix  = f"  {CYAN}{BOLD}┌{RST}{CYAN}─{RST} "
+    icon_s  = f"{icon} " if icon else ""
+    heading = f"{BOLD}{WHITE}{icon_s}{title}{RST}"
+    used    = _vis(prefix) + _vis(heading) + 4
+    fill    = max(2, w - used)
+    line    = f"{DIM}{SMOKE}{'─' * fill}{RST}"
+    print(f"\n{prefix}{heading}  {line}")
 
 
 def asn_code(field):
@@ -650,154 +733,167 @@ def render_full(sys_info, wg, wg_config, ping_r, routing, ks,
     inner = w - 4
 
     # ── Header box ─────────────────────────────────────────────────────────────
-    t1 = f"{BOLD}✦  protonwg-sentinel{RST}  {DIM}v5.0{RST}"
-    t2 = f"{DIM}{utc}  ·  {loc}{RST}"
-    t3 = f"{DIM}Press {BOLD}Enter{RST}{DIM} for a fresh full report   ·   Ctrl-C to quit{RST}"
-    print(f"\n{_box_top(inner)}")
-    print(_box_row(t1, inner))
-    print(_box_row(t2, inner))
-    print(_box_mid(inner))
-    print(_box_row(t3, inner))
-    print(f"{_box_bot(inner)}")
+    t1 = (f"{BOLD}{AQUA}✦{RST}  {BOLD}{WHITE}protonwg-sentinel{RST}"
+          f"  {DIM}{SMOKE}v{VERSION}{RST}")
+    t2 = f"{DIM}{SILVER}🕐  {utc}  {SMOKE}·{RST}  {DIM}{SILVER}{loc}{RST}"
+    t3 = (f"{DIM}{SMOKE}Press {RST}{BOLD}{SILVER}Enter{RST}"
+          f"{DIM}{SMOKE} for fresh report   ·   Ctrl-C to quit{RST}")
+    print(f"\n{_box_top(inner, INDIGO)}")
+    print(_box_row(t1, inner, INDIGO))
+    print(_box_row(t2, inner, INDIGO))
+    print(_box_mid(inner, INDIGO))
+    print(_box_row(t3, inner, INDIGO))
+    print(f"{_box_bot(inner, INDIGO)}")
 
     # ── System ─────────────────────────────────────────────────────────────────
-    section("🖥   SYSTEM")
-    row("Hostname", sys_info["hostname"])
-    row("OS",       sys_info["os"])
-    row("Arch",     sys_info["arch"])
-    row("Python",   sys_info["python"])
+    section("SYSTEM", "🖥 ")
+    row("Hostname", sys_info["hostname"], SILVER)
+    row("OS",       sys_info["os"],       SILVER)
+    row("Arch",     sys_info["arch"],     SILVER)
+    row("Python",   sys_info["python"],   DIM)
 
     # ── WireGuard ──────────────────────────────────────────────────────────────
-    section(f"🔒  WIREGUARD  [{INTERFACE}]")
+    section(f"WIREGUARD  [{INTERFACE}]", "🔒")
     lvl  = wg["level"]
-    wg_c = GREEN if lvl == "ok" else (YELLOW if lvl == "stale" else RED)
+    wg_c = (LIME if lvl == "ok"
+            else AMBER if lvl == "stale"
+            else ROSE  if lvl == "never"
+            else RED)
     wg_i = "✅" if lvl == "ok" else ("⚠️ " if lvl == "stale" else "❌")
-    print(f"  {wg_i}  {wg_c}{wg['msg']}{RST}")
+    print(f"  {wg_i}  {wg_c}{BOLD}{wg['msg']}{RST}")
 
     if ping_r["ok"]:
+        lat_c = _latency_color(ping_r["latency_ms"])
         try:
-            ms    = float(ping_r["latency_ms"])
-            lat_c = GREEN if ms < 50 else YELLOW if ms < 120 else RED
-        except ValueError:
-            lat_c = DIM
-        print(f"  📡  {BOLD}Endpoint:{RST} {DIM}{ping_r['endpoint']}{RST}  "
-              f"latency {lat_c}{ping_r['latency_ms']} ms avg{RST}")
+            lat_frac = min(1.0, float(ping_r["latency_ms"]) / 200)
+        except (ValueError, TypeError):
+            lat_frac = 0.0
+        bar   = _progress_bar(lat_frac, width=16, fill_color=lat_c, empty_color=SMOKE)
+        print(f"  📡  {BOLD}{SILVER}Endpoint:{RST}  {DIM}{ping_r['endpoint']}{RST}"
+              f"   {lat_c}{BOLD}{ping_r['latency_ms']} ms{RST}  {bar}")
     else:
-        print(f"  📡  {BOLD}Endpoint ping:{RST} {DIM}{ping_r['msg']}{RST}")
+        print(f"  📡  {BOLD}{SILVER}Endpoint ping:{RST}  {DIM}{ping_r['msg']}{RST}")
 
-    # ── WireGuard config validation
-    section("⚙️   WIREGUARD CONFIG VALIDATION")
+    # ── WireGuard config validation ────────────────────────────────────────────
+    section("WIREGUARD CONFIG", "⚙️ ")
     if wg_config["info"]:
         for line in wg_config["info"]:
-            print(f"  ✅  {GREEN}{line}{RST}")
+            print(f"  {LIME}✓{RST}  {GREEN}{line}{RST}")
     if wg_config["warnings"]:
         for line in wg_config["warnings"]:
-            c = YELLOW if "split-tunnel" in line.lower() or "unreadable" in line.lower() else RED
-            print(f"  ⚠️   {c}{line}{RST}")
+            c = AMBER if ("split-tunnel" in line.lower()
+                          or "unreadable" in line.lower()) else CORAL
+            print(f"  {AMBER}⚠{RST}  {c}{line}{RST}")
     if not wg_config["info"] and not wg_config["warnings"]:
         print(f"  {DIM}No configuration data retrieved{RST}")
 
     # ── Routing & kill switch ──────────────────────────────────────────────────
-    section("🛤   ROUTING & KILL SWITCH")
+    section("ROUTING & KILL SWITCH", "🛤 ")
 
     if routing["default_via_vpn"]:
-        note = f"  {DIM}{routing['warning']}{RST}" if routing["warning"] else ""
-        print(f"  ✅  {GREEN}Default route confirmed via {INTERFACE}{RST}{note}")
+        note = (f"  {DIM}{SMOKE}{routing['warning']}{RST}"
+                if routing["warning"] else "")
+        print(f"  ✅  {LIME}Default route confirmed via {BOLD}{INTERFACE}{RST}"
+              f"{LIME} ✓{RST}{note}")
     else:
-        print(f"  ❌  {RED}{routing['warning'] or 'Default route not through VPN'}{RST}")
+        print(f"  ❌  {RED}{BOLD}{routing['warning'] or f'Default route not through VPN'}{RST}")
 
     if ks["active"]:
-        print(f"  ✅  {GREEN}Kill switch active — {ks['details']}{RST}")
+        print(f"  ✅  {LIME}Kill switch active{RST}  {DIM}—  {ks['details']}{RST}")
     else:
-        ks_c = YELLOW if "unavailable" in ks["details"].lower() else ORANGE
+        ks_c = AMBER if "unavailable" in ks["details"].lower() else CORAL
         print(f"  ⚠️   {ks_c}Kill switch: {ks['details']}{RST}")
 
     # ── IP & Location ──────────────────────────────────────────────────────────
-    section("🌐  IP ADDRESS & LOCATION")
+    section("IP ADDRESS & LOCATION", "🌐")
 
-    pc = (GREEN if proton["level"] == "owned"
-          else ORANGE if proton["level"] == "partner" else RED)
+    pc = (LIME  if proton["level"] == "owned"
+          else AMBER if proton["level"] == "partner"
+          else RED)
     pi = ("✅" if proton["level"] == "owned"
           else "🟠" if proton["level"] == "partner" else "❌")
 
-    row("IPv4 (exit IP)", ipv4 or "not detected", CYAN if ipv4 else RED)
-    row("IPv6 (exit IP)", ipv6 or "not detected", CYAN if ipv6 else DIM)
-    print(f"\n  {pi}  {BOLD}ProtonVPN:{RST} {pc}{proton['msg']}{RST}")
+    row("IPv4 (exit IP)", ipv4 or "not detected",
+        AQUA if ipv4 else RED)
+    row("IPv6 (exit IP)", ipv6 or "not detected",
+        TEAL if ipv6 else DIM)
+    print(f"\n  {pi}  {BOLD}{WHITE}ProtonVPN:{RST}  {pc}{proton['msg']}{RST}")
 
     # Source 1 — ip-api.com
-    print(f"\n  {BOLD}Source 1  {DIM}ip-api.com{RST}")
+    print(f"\n  {BOLD}{LAVENDER}◈  Source 1{RST}  {DIM}{SMOKE}ip-api.com{RST}")
     if ip_api_d:
-        row("Country",       f"{ip_api_d.get('country','?')} ({ip_api_d.get('countryCode','?')})", indent=1)
-        row("Region / City", f"{ip_api_d.get('regionName','?')} / {ip_api_d.get('city','?')}", indent=1)
-        row("ZIP",           ip_api_d.get("zip","?"), indent=1)
-        row("Coords",        f"lat {ip_api_d.get('lat','?')},  lon {ip_api_d.get('lon','?')}", indent=1)
-        row("Timezone",      ip_api_d.get("timezone","?"), indent=1)
-        row("ISP",           ip_api_d.get("isp","?"), indent=1)
-        row("Org",           ip_api_d.get("org","?"), indent=1)
-        row("ASN",           ip_api_d.get("as","?"), indent=1)
+        row("Country",       f"{ip_api_d.get('country','?')} ({ip_api_d.get('countryCode','?')})", SILVER, indent=1)
+        row("Region / City", f"{ip_api_d.get('regionName','?')} / {ip_api_d.get('city','?')}", SILVER, indent=1)
+        row("ZIP",           ip_api_d.get("zip","?"), DIM, indent=1)
+        row("Coords",        f"lat {ip_api_d.get('lat','?')},  lon {ip_api_d.get('lon','?')}", DIM, indent=1)
+        row("Timezone",      ip_api_d.get("timezone","?"), DIM, indent=1)
+        row("ISP",           ip_api_d.get("isp","?"), SILVER, indent=1)
+        row("Org",           ip_api_d.get("org","?"), DIM, indent=1)
+        row("ASN",           ip_api_d.get("as","?"), AQUA, indent=1)
     else:
         print(f"      {RED}unavailable{RST}")
 
     # Source 2 — ipinfo.io
-    print(f"\n  {BOLD}Source 2  {DIM}ipinfo.io{RST}")
+    print(f"\n  {BOLD}{LAVENDER}◈  Source 2{RST}  {DIM}{SMOKE}ipinfo.io{RST}")
     if ipinf_d:
-        row("IP",            ipinf_d.get("ip","?"), indent=1)
-        row("City / Region", f"{ipinf_d.get('city','?')} / {ipinf_d.get('region','?')}", indent=1)
-        row("Country",       ipinf_d.get("country","?"), indent=1)
-        row("Org / ASN",     ipinf_d.get("org","?"), indent=1)
-        row("Hostname",      ipinf_d.get("hostname","none"), indent=1)
-        row("Timezone",      ipinf_d.get("timezone","?"), indent=1)
+        row("IP",            ipinf_d.get("ip","?"), AQUA, indent=1)
+        row("City / Region", f"{ipinf_d.get('city','?')} / {ipinf_d.get('region','?')}", SILVER, indent=1)
+        row("Country",       ipinf_d.get("country","?"), SILVER, indent=1)
+        row("Org / ASN",     ipinf_d.get("org","?"), AQUA, indent=1)
+        row("Hostname",      ipinf_d.get("hostname","none"), DIM, indent=1)
+        row("Timezone",      ipinf_d.get("timezone","?"), DIM, indent=1)
     else:
         print(f"      {RED}unavailable{RST}")
 
     # Source 3 — ipwho.is
-    print(f"\n  {BOLD}Source 3  {DIM}ipwho.is{RST}")
+    print(f"\n  {BOLD}{LAVENDER}◈  Source 3{RST}  {DIM}{SMOKE}ipwho.is{RST}")
     if ipwho_d and ipwho_d.get("success"):
         conn = ipwho_d.get("connection", {})
-        row("IP",            ipwho_d.get("ip","?"), indent=1)
-        row("Country",       f"{ipwho_d.get('country','?')} ({ipwho_d.get('country_code','?')})", indent=1)
-        row("Region / City", f"{ipwho_d.get('region','?')} / {ipwho_d.get('city','?')}", indent=1)
-        row("Continent",     ipwho_d.get("continent","?"), indent=1)
-        row("Coords",        f"lat {ipwho_d.get('latitude','?')},  lon {ipwho_d.get('longitude','?')}", indent=1)
-        row("ISP",           conn.get("isp","?"), indent=1)
-        row("Org",           conn.get("org","?"), indent=1)
-        row("ASN",           str(conn.get("asn","?")), indent=1)
+        row("IP",            ipwho_d.get("ip","?"), AQUA, indent=1)
+        row("Country",       f"{ipwho_d.get('country','?')} ({ipwho_d.get('country_code','?')})", SILVER, indent=1)
+        row("Region / City", f"{ipwho_d.get('region','?')} / {ipwho_d.get('city','?')}", SILVER, indent=1)
+        row("Continent",     ipwho_d.get("continent","?"), DIM, indent=1)
+        row("Coords",        f"lat {ipwho_d.get('latitude','?')},  lon {ipwho_d.get('longitude','?')}", DIM, indent=1)
+        row("ISP",           conn.get("isp","?"), SILVER, indent=1)
+        row("Org",           conn.get("org","?"), DIM, indent=1)
+        row("ASN",           str(conn.get("asn","?")), AQUA, indent=1)
     else:
         print(f"      {RED}unavailable{RST}")
 
     # ── DNS leak ───────────────────────────────────────────────────────────────
-    section("🔍  DNS LEAK TEST")
+    section("DNS LEAK TEST", "🔍")
 
     def show_dns(label, resolvers):
         level, summary = assess_dns(resolvers, vpn_asn)
         ic = "✅" if level == "ok" else ("⚠️ " if level == "warn" else "❌")
-        co = GREEN if level == "ok" else (YELLOW if level == "warn" else RED)
-        print(f"\n  {BOLD}{label}{RST}")
+        co = LIME if level == "ok" else (AMBER if level == "warn" else RED)
+        print(f"\n  {BOLD}{SILVER}{label}{RST}")
         print(f"  {ic}  {co}{summary}{RST}")
         for r in resolvers:
             ip  = r.get("ip","?")
             isp = r.get("isp") or "?"
             cc  = r.get("country_code","?")
             if is_proton_internal(ip):
-                tag = f"  {GREEN}← ProtonVPN internal tunnel DNS ✓{RST}"
+                tag = f"  {LIME}← ProtonVPN internal tunnel DNS ✓{RST}"
             elif ip in KNOWN_SAFE_DNS_IPS:
-                tag = f"  {GREEN}← known-safe public DNS ✓{RST}"
+                tag = f"  {MINT}← known-safe public DNS ✓{RST}"
             elif vpn_asn in PROTON_OWNED_ASN | PROTON_PARTNER_ASN:
-                tag = f"  {GREEN}← Proton network ✓{RST}"
+                tag = f"  {LIME}← Proton network ✓{RST}"
             elif any(kw in isp.lower() for kw in PROTON_DNS_KW):
-                tag = f"  {GREEN}← Proton DNS ✓{RST}"
+                tag = f"  {LIME}← Proton DNS ✓{RST}"
             else:
                 tag = f"  {RED}← possible leak — not Proton DNS{RST}"
-            print(f"      {DIM}→{RST}  {CYAN}{ip:<42}{RST}  {isp} [{cc}]{tag}")
+            print(f"      {DIM}→{RST}  {AQUA}{ip:<42}{RST}  {DIM}{isp} [{cc}]{RST}{tag}")
 
     show_dns("Standard check  —  ipleak.net API", std)
     show_dns("Advanced check  —  bash.ws  (same backend as dnsleaktest.com Extended Test)", adv)
-    print(f"\n  {DIM}Manual check: https://www.dnsleaktest.com → Extended Test{RST}")
+    print(f"\n  {DIM}Manual check:{RST}  {DIM}https://www.dnsleaktest.com → Extended Test{RST}")
 
     # ── Footer ─────────────────────────────────────────────────────────────────
-    print(f"\n{DIM}{'─' * w}{RST}")
-    print(f"  {DIM}Switching to compact status in {BOLD}3s{RST}{DIM}…   "
-          f"Press {BOLD}Enter{RST}{DIM} to repeat this report{RST}\n")
+    print(f"\n{DIM}{SMOKE}{'─' * w}{RST}")
+    print(f"  {DIM}{SMOKE}Switching to compact status in {RST}{BOLD}{SILVER}3s{RST}"
+          f"{DIM}{SMOKE}…   Press {RST}{BOLD}{SILVER}Enter{RST}"
+          f"{DIM}{SMOKE} to repeat this report{RST}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -808,7 +904,7 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
                    location=""):
     """
     Single-screen status dashboard.
-    Full-width boxed banner at the top — green, yellow, or red.
+    Full-width boxed banner at the top — colour reflects overall health.
     Individual indicator lines below for every check.
     """
     print("\033[2J\033[H", end="")
@@ -827,74 +923,97 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
     any_red   = (lvl in ("dead", "never", "error") or not route_ok or dns_leak)
 
     if all_green:
-        bdr_c      = GREEN
-        banner_txt = f"{BOLD}  ✅  CONNECTED  —  ProtonVPN WireGuard tunnel is healthy  ✓{RST}"
+        bdr_c      = LIME
+        badge      = f"{BOLD}{LIME}✦ PROTECTED{RST}"
+        banner_txt = (f"{BOLD}{LIME}  ✅  CONNECTED{RST}  {DIM}{SMOKE}—{RST}  "
+                      f"{LIME}ProtonVPN WireGuard tunnel is healthy{RST}")
     elif any_red:
         bdr_c      = RED
-        banner_txt = f"{BOLD}  ❌  WARNING  —  VPN issue detected — check details below{RST}"
+        badge      = f"{BOLD}{RED}✦ ALERT{RST}"
+        banner_txt = (f"{BOLD}{RED}  ❌  WARNING{RST}  {DIM}{SMOKE}—{RST}  "
+                      f"{CORAL}VPN issue detected — check details below{RST}")
     else:
-        bdr_c      = YELLOW
-        banner_txt = f"{BOLD}  ⚠️   DEGRADED  —  some checks need attention{RST}"
+        bdr_c      = AMBER
+        badge      = f"{BOLD}{AMBER}✦ DEGRADED{RST}"
+        banner_txt = (f"{BOLD}{AMBER}  ⚠️   DEGRADED{RST}  {DIM}{SMOKE}—{RST}  "
+                      f"{AMBER}some checks need attention{RST}")
 
     # Status banner box
     print(f"\n{_box_top(inner, bdr_c)}")
     print(_box_row(banner_txt, inner, bdr_c))
     print(f"{_box_bot(inner, bdr_c)}")
 
-    # Timestamps & hints
-    print(f"\n  {DIM}🕐  {utc}  ·  {loc}{RST}")
-    print(f"  {DIM}📋  Last full report: {BOLD}{last_full_utc}{RST}"
-          f"{DIM}   ·   Next auto-check in: {BOLD}{next_full_in}s{RST}")
-    print(f"  {DIM}⌨   Press {BOLD}Enter{RST}{DIM} for full report   ·   Ctrl-C to quit{RST}")
+    # Next-check progress bar
+    elapsed_frac = max(0.0, 1.0 - next_full_in / max(1, FULL_INTERVAL))
+    bar_color    = TEAL if all_green else (CORAL if any_red else AMBER)
+    prog_bar     = _progress_bar(elapsed_frac, width=inner - 18, fill_color=bar_color)
+    bar_label    = f"{DIM}{SMOKE}next check in {RST}{BOLD}{SILVER}{next_full_in}s{RST}"
+    print(f"\n  {prog_bar}  {bar_label}")
 
-    print(f"\n  {DIM}{'─' * (w - 4)}{RST}")
+    # Timestamps & hints
+    print(f"  {DIM}{SMOKE}🕐  {utc}  ·  {loc}{RST}")
+    print(f"  {DIM}{SMOKE}📋  Last report: {RST}{BOLD}{SILVER}{last_full_utc}{RST}"
+          f"  {DIM}{SMOKE}·  {RST}{DIM}Press {BOLD}Enter{RST}{DIM} for full report   ·   Ctrl-C to quit{RST}")
+
+    # Section divider
+    print(f"\n  {DIM}{SMOKE}{'─' * (w - 4)}{RST}")
+
+    # ── Check rows ─────────────────────────────────────────────────────────────
+    # Helper for consistent check-row formatting
+    def _crow(icon, label, color, value):
+        lbl = f"{BOLD}{SILVER}{label:<20}{RST}"
+        print(f"  {icon}  {lbl}  {color}{value}{RST}")
 
     # WireGuard
-    wg_c  = GREEN if lvl == "ok" else (YELLOW if lvl == "stale" else RED)
+    wg_c  = (LIME  if lvl == "ok"
+              else AMBER if lvl == "stale"
+              else CORAL if lvl == "never"
+              else RED)
     wg_ic = "✅" if lvl == "ok" else ("⚠️ " if lvl == "stale" else "❌")
-    print(f"  {wg_ic}  {BOLD}{CYAN}{'WireGuard':<20}{RST}  {wg_c}{wg['msg']}{RST}")
+    _crow(wg_ic, "WireGuard", wg_c, wg["msg"])
 
     # Latency
     if ping_r["ok"]:
+        lat_c = _latency_color(ping_r["latency_ms"])
         try:
-            ms    = float(ping_r["latency_ms"])
-            lat_c = GREEN if ms < 50 else YELLOW if ms < 120 else RED
-        except ValueError:
-            lat_c = DIM
-        print(f"  📡  {BOLD}{CYAN}{'Endpoint latency':<20}{RST}  "
-              f"{lat_c}{ping_r['latency_ms']} ms{RST}  "
-              f"{DIM}→ {ping_r['endpoint']}{RST}")
+            lat_frac = min(1.0, float(ping_r["latency_ms"]) / 200)
+        except (ValueError, TypeError):
+            lat_frac = 0.0
+        bar   = _progress_bar(lat_frac, width=10, fill_color=lat_c, empty_color=SMOKE)
+        _crow("📡", "Endpoint latency", lat_c,
+              f"{BOLD}{ping_r['latency_ms']} ms{RST}  {bar}  "
+              f"{DIM}{ping_r['endpoint']}{RST}")
     else:
-        print(f"  📡  {BOLD}{CYAN}{'Endpoint latency':<20}{RST}  {DIM}{ping_r['msg']}{RST}")
+        _crow("📡", "Endpoint latency", DIM, ping_r["msg"])
 
     # Exit IP
-    ip_c = CYAN if ipv4 else RED
-    print(f"  🌐  {BOLD}{CYAN}{'Exit IPv4':<20}{RST}  {ip_c}{ipv4 or 'not detected'}{RST}")
+    _crow("🌐", "Exit IPv4", AQUA if ipv4 else RED, ipv4 or "not detected")
     if ipv6:
-        print(f"  🌐  {BOLD}{CYAN}{'Exit IPv6':<20}{RST}  {CYAN}{ipv6}{RST}")
+        _crow("🌐", "Exit IPv6", TEAL, ipv6)
 
     # ProtonVPN ASN
-    pc = (GREEN if proton["level"] == "owned"
-          else ORANGE if proton["level"] == "partner" else RED)
+    pc = (LIME  if proton["level"] == "owned"
+          else AMBER if proton["level"] == "partner"
+          else RED)
     pi = ("✅" if proton["level"] == "owned"
           else "🟠" if proton["level"] == "partner" else "❌")
-    print(f"  {pi}  {BOLD}{CYAN}{'ProtonVPN ASN':<20}{RST}  {pc}{proton['msg']}{RST}")
+    _crow(pi, "ProtonVPN ASN", pc, proton["msg"])
 
     # Exit location
     if location:
-        print(f"  📍  {BOLD}{CYAN}{'Location':<20}{RST}  {CYAN}{location}{RST}")
+        _crow("📍", "Location", SILVER, location)
 
     # Default route
     r_ic  = "✅" if route_ok else "❌"
-    r_c   = GREEN if route_ok else RED
+    r_c   = LIME if route_ok else RED
     r_msg = (f"Default route via {INTERFACE} ✓" if route_ok
              else (routing["warning"] or f"Not routed via {INTERFACE}"))
-    print(f"  {r_ic}  {BOLD}{CYAN}{'Default route':<20}{RST}  {r_c}{r_msg}{RST}")
+    _crow(r_ic, "Default route", r_c, r_msg)
 
     # Kill switch
     ks_ic = "✅" if ks["active"] else "⚠️ "
-    ks_c  = GREEN if ks["active"] else YELLOW
-    print(f"  {ks_ic}  {BOLD}{CYAN}{'Kill switch':<20}{RST}  {ks_c}{ks['details']}{RST}")
+    ks_c  = LIME if ks["active"] else AMBER
+    _crow(ks_ic, "Kill switch", ks_c, ks["details"])
 
     # DNS checks
     for label, lvl2, msg in (
@@ -902,10 +1021,10 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
         ("DNS advanced", adv_lvl, assess_dns(adv, vpn_asn)[1]),
     ):
         d_ic = "✅" if lvl2 == "ok" else ("⚠️ " if lvl2 == "warn" else "❌")
-        d_c  = GREEN if lvl2 == "ok" else (YELLOW if lvl2 == "warn" else RED)
-        print(f"  {d_ic}  {BOLD}{CYAN}{label:<20}{RST}  {d_c}{msg}{RST}")
+        d_c  = LIME if lvl2 == "ok" else (AMBER if lvl2 == "warn" else RED)
+        _crow(d_ic, label, d_c, msg)
 
-    print(f"  {DIM}{'─' * (w - 4)}{RST}\n")
+    print(f"  {DIM}{SMOKE}{'─' * (w - 4)}{RST}\n")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -987,20 +1106,32 @@ def main():
     print("\033[2J\033[H", end="")
     w     = _tw()
     inner = w - 4
-    t1 = f"{BOLD}✦  protonwg-sentinel{RST}  {DIM}v5.0{RST}"
-    print(f"\n{_box_top(inner)}")
-    print(_box_row(t1, inner))
-    print(f"{_box_bot(inner)}\n")
-    print(f"  {DIM}⏳  Gathering data — fetching IPs, running DNS leak tests,{RST}")
-    print(f"  {DIM}    pinging WireGuard endpoint…  (this takes ~10s){RST}\n")
+    t1 = (f"{BOLD}{AQUA}✦{RST}  {BOLD}{WHITE}protonwg-sentinel{RST}"
+          f"  {DIM}{SMOKE}v{VERSION}{RST}")
+    print(f"\n{_box_top(inner, INDIGO)}")
+    print(_box_row(t1, inner, INDIGO))
+    print(f"{_box_bot(inner, INDIGO)}\n")
 
-    # ── Initial full data collection ───────────────────────────────────────────
-    data          = collect_all()
-    wg            = check_wg(INTERFACE)
-    wg_config     = check_wg_config(INTERFACE)
-    ping_r        = ping_wg_endpoint(INTERFACE)
-    routing       = check_routing(INTERFACE)
-    ks            = check_killswitch()
+    _steps = [
+        "Fetching public IPv4 / IPv6 addresses…",
+        "Querying ip-api.com, ipinfo.io, ipwho.is…",
+        "Running standard DNS leak check (ipleak.net)…",
+        "Running advanced DNS leak test (bash.ws)…",
+        "Pinging WireGuard endpoint…",
+    ]
+    print(f"  {DIM}{SMOKE}Starting up — collecting network data (≈ 10 s){RST}\n")
+    for step in _steps:
+        print(f"  {DIM}{TEAL}○{RST}  {DIM}{SMOKE}{step}{RST}")
+    print()
+
+    with Spinner("Gathering all data — please wait…"):
+        data      = collect_all()
+        wg        = check_wg(INTERFACE)
+        wg_config = check_wg_config(INTERFACE)
+        ping_r    = ping_wg_endpoint(INTERFACE)
+        routing   = check_routing(INTERFACE)
+        ks        = check_killswitch()
+
     last_full_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     last_full_ts  = time.time()
     log_connection(data, wg, data["proton"], data["vpn_asn"],
@@ -1032,13 +1163,22 @@ def main():
             # ── Full re-check ──────────────────────────────────────────────────
             _force_full.clear()
             print("\033[2J\033[H", end="")
-            print(f"\n  {BOLD}{CYAN}↻{RST}  {DIM}Re-fetching all network data…{RST}\n")
-            data          = collect_all()
-            wg            = check_wg(INTERFACE)
-            wg_config     = check_wg_config(INTERFACE)
-            ping_r        = ping_wg_endpoint(INTERFACE)
-            routing       = check_routing(INTERFACE)
-            ks            = check_killswitch()
+            w     = _tw()
+            inner = w - 4
+            t1 = (f"{BOLD}{AQUA}✦{RST}  {BOLD}{WHITE}protonwg-sentinel{RST}"
+                  f"  {DIM}{SMOKE}v{VERSION}{RST}")
+            print(f"\n{_box_top(inner, INDIGO)}")
+            print(_box_row(t1, inner, INDIGO))
+            print(f"{_box_bot(inner, INDIGO)}\n")
+
+            with Spinner("Re-fetching all network data…"):
+                data      = collect_all()
+                wg        = check_wg(INTERFACE)
+                wg_config = check_wg_config(INTERFACE)
+                ping_r    = ping_wg_endpoint(INTERFACE)
+                routing   = check_routing(INTERFACE)
+                ks        = check_killswitch()
+
             last_full_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
             last_full_ts  = time.time()
             log_connection(data, wg, data["proton"], data["vpn_asn"],
