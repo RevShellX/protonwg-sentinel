@@ -44,7 +44,11 @@ COMPACT_INTERVAL = 5          # seconds between compact status refreshes
 FULL_INTERVAL    = 60         # seconds between automatic full re-checks
 HTTP_TIMEOUT     = 6
 DNS_TIMEOUT      = 8
-W                = 72         # display width
+W                = 72         # display width (fallback when terminal width unavailable)
+MIN_WIDTH        = 72         # minimum terminal width used by _tw()
+MAX_WIDTH        = 120        # maximum terminal width used by _tw()
+TERM_MARGIN      = 2          # columns to subtract from raw terminal width in _tw()
+BOX_PADDING      = 2          # spaces between box border and content in _box_row()
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── ProtonVPN ASN database ─────────────────────────────────────────────────────
@@ -113,16 +117,19 @@ def _vis(s):
 
 
 def _tw():
-    """Terminal width, clamped to 72–120 columns."""
+    """Terminal width, clamped to MIN_WIDTH–MAX_WIDTH columns.
+    Falls back to W (the configured display width) if size cannot be queried."""
     try:
-        return max(72, min(shutil.get_terminal_size().columns - 2, 120))
+        return max(MIN_WIDTH, min(shutil.get_terminal_size().columns - TERM_MARGIN, MAX_WIDTH))
     except Exception:
         return W
 
 
 def _box_row(content, inner, border_color=CYAN):
-    """Return a box content row: ║  <content><padding>  ║"""
-    pad = max(0, inner - 2 - _vis(content))
+    """Return a box content row: ║  <content><padding>  ║
+    inner = total inner width (box width minus the two border chars).
+    BOX_PADDING spaces are added on each side of the content."""
+    pad = max(0, inner - BOX_PADDING - _vis(content))
     return (f"{border_color}{BOLD}║{RST}  {content}"
             f"{' ' * pad}  {border_color}{BOLD}║{RST}")
 
