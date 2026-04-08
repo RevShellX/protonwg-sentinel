@@ -537,7 +537,7 @@ def render_full(sys_info, wg, ping_r, routing, ks,
     inner = w - 4
 
     # ── Header box ─────────────────────────────────────────────────────────────
-    t1 = f"{BOLD}🛡   protonwg-sentinel{RST}  {DIM}v5.0{RST}"
+    t1 = f"{BOLD}✦  protonwg-sentinel{RST}  {DIM}v5.0{RST}"
     t2 = f"{DIM}{utc}  ·  {loc}{RST}"
     t3 = f"{DIM}Press {BOLD}Enter{RST}{DIM} for a fresh full report   ·   Ctrl-C to quit{RST}"
     print(f"\n{_box_top(inner)}")
@@ -816,7 +816,7 @@ def main():
     print("\033[2J\033[H", end="")
     w     = _tw()
     inner = w - 4
-    t1 = f"{BOLD}🛡   protonwg-sentinel{RST}  {DIM}v5.0{RST}"
+    t1 = f"{BOLD}✦  protonwg-sentinel{RST}  {DIM}v5.0{RST}"
     print(f"\n{_box_top(inner)}")
     print(_box_row(t1, inner))
     print(f"{_box_bot(inner)}\n")
