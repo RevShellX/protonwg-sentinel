@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-protonwg-sentinel  v5.0
+protonwg-sentinel  v6.0
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WireGuard + ProtonVPN connection monitor — stdlib only, no pip needed
 
@@ -12,26 +12,30 @@ Behaviour:
 
 Checks:
   • WireGuard tunnel handshake freshness
+  • WireGuard configuration validation (AllowedIPs, keepalive, listening port)
   • Public IPv4 and IPv6 exit addresses
   • Full location + ISP info  (3 independent sources)
-  • ProtonVPN ASN ownership   (green / orange / red)
+  • ProtonVPN ASN ownership   (✓ Proton-owned / ⚙ partner / ❌ unknown)
   • DNS leak — standard (ipleak.net) + advanced (bash.ws / dnsleaktest engine)
-  • ProtonVPN internal resolver recognition  (10.x.x.x = safe, not a leak)
+  • DNS resolver classification (Proton internal / known-safe / possible leak)
+  • ProtonVPN internal resolver recognition  (10.x.x.x = safe, not a false-positive leak)
   • Default route sanity  (traffic actually goes through VPN interface)
   • Kill-switch detection  (iptables / nftables DROP rules)
   • WireGuard endpoint ping latency
   • System identity: hostname, OS, kernel, architecture
+  • Historical connection logging  (~/.local/share/protonwg-sentinel/connections.json)
 
 ASN / infrastructure sources:
   • ProtonVPN server map  : https://www.netify.ai/resources/vpns/proton-vpn
   • ASN verified          : https://bgp.he.net  +  https://ipinfo.io
   • Proton-owned ASNs     : https://ipinfo.io/AS209103 | https://ipinfo.io/AS51396
+  • BGP intelligence      : https://bgp.tools  |  https://www.peeringdb.com
 
-GitHub: https://github.com/YOUR_USERNAME/protonwg-sentinel
+GitHub: https://github.com/RevShellX/protonwg-sentinel
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
 
-import ipaddress, json, platform, random, re, shutil, signal, socket
+import ipaddress, json, os, platform, random, re, shutil, signal, socket
 import string, subprocess, sys, termios, threading, time, tty, unicodedata
 import urllib.request
 from datetime import datetime, timezone
@@ -49,30 +53,57 @@ MIN_WIDTH        = 72         # minimum terminal width used by _tw()
 MAX_WIDTH        = 120        # maximum terminal width used by _tw()
 TERM_MARGIN      = 2          # columns to subtract from raw terminal width in _tw()
 BOX_PADDING      = 2          # spaces between box border and content in _box_row()
+LOG_DIR          = os.path.expanduser("~/.local/share/protonwg-sentinel")
+LOG_FILE         = os.path.join(LOG_DIR, "connections.json")
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── ProtonVPN ASN database ─────────────────────────────────────────────────────
 
-# ✅ GREEN — IP blocks owned directly by Proton AG
-# Source: https://ipinfo.io/AS209103  |  https://ipinfo.io/AS51396
+# ✅ Proton AG — IP blocks owned directly by Proton AG  (✓ official)
+# Sources: https://ipinfo.io/AS209103  |  https://bgp.tools  |  https://www.netify.ai/resources/vpns/proton-vpn
 PROTON_OWNED_ASN = {
-    "AS209103",   # Proton AG  (primary)
+    "AS209103",   # Proton AG  (primary — Secure Core, Switzerland)
     "AS51396",    # Proton AG  (secondary)
+    "AS62371",    # Proton AG  (main / upstream Switzerland)
+    "AS199218",   # Proton AG  (ProtonVPN-2 — newer infrastructure)
+    "AS208172",   # Proton AG  (expansion network)
+    "AS207951",   # Proton AG  (additional allocation)
 }
 
-# 🟠 ORANGE — confirmed datacenter partners (leased, Proton-controlled)
-# Source: https://www.netify.ai/resources/vpns/proton-vpn  +  bgp.he.net
-# NOTE: orange does NOT mean unsafe — traffic is WireGuard-encrypted end-to-end
+# ⚙  PARTNER — contracted datacenter partners (leased, Proton-controlled)  (⚙ partner)
+# Sources: https://www.netify.ai/resources/vpns/proton-vpn  +  bgp.he.net  +  bgp.tools
+# NOTE: partner does NOT mean unsafe — traffic is WireGuard-encrypted end-to-end
 PROTON_PARTNER_ASN = {
-    "AS9009",    # M247 Europe SRL        — most common ProtonVPN exit (EU + US)
-    "AS60068",   # Datacamp Limited       — all regions
-    "AS212238",  # Datacamp Limited       — secondary ASN
-    "AS46562",   # Performive LLC         — Canada / US
+    # M247 — most common ProtonVPN exit provider
+    "AS9009",    # M247 Europe SRL        — EU + US (primary)
+    "AS51332",   # M247 Ltd               — secondary allocation
+    # Datacamp / CDN77
+    "AS60068",   # Datacamp Ltd / CDN77   — Europe & global CDN
+    "AS212238",  # Datacamp Ltd           — additional capacity
+    # Performive / TSS
+    "AS46562",   # Performive LLC         — North America
+    # GTHost
     "AS63023",   # GTHost                 — US (Phoenix)
+    # Worldstream / NovoServe
     "AS49981",   # Worldstream B.V.       — Netherlands (Amsterdam)
     "AS24875",   # NovoServe B.V.         — Netherlands (Amsterdam)
-    "AS262287",  # Latitude.sh LTDA       — South America / formerly Maxihost
+    # Latitude.sh (formerly Maxihost)
+    "AS35432",   # Latitude.sh            — hosting partner
+    "AS262287",  # Latitude.sh LTDA       — South America
     "AS396356",  # Latitude.sh LLC        — South America / US
+    # Tele2 / Bahnhof — Scandinavia
+    "AS1257",    # Tele2 AB               — Estonia / Scandinavia
+    "AS8473",    # Bahnhof AB             — Sweden
+    # Creanova — Finland
+    "AS202053",  # Creanova Oy            — Finland
+    # Choopa / Vultr — global
+    "AS20473",   # Choopa LLC / Vultr     — global hosting
+    # Cloudflare — upstream peer
+    "AS13335",   # Cloudflare Inc.        — upstream peer / CDN
+    # Telecom Egypt — Middle East
+    "AS8452",    # Telecom Egypt          — Middle East
+    # Akamai / Linode
+    "AS16247",   # Akamai / Linode        — global content delivery
 }
 
 PROTON_DNS_KW = {"proton", "protonvpn", "proton.me", "proton.ch"}
@@ -83,6 +114,43 @@ PROTON_INTERNAL_RANGES = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("100.64.0.0/10"),
 ]
+
+# Human-readable labels for every known ASN
+# Format: ASN -> (short_name, trust_indicator)   ✓ = Proton-owned   ⚙ = partner
+ASN_LABELS = {
+    # Official Proton AG
+    "AS209103": ("Proton AG",        "✓"),
+    "AS51396":  ("Proton AG",        "✓"),
+    "AS62371":  ("Proton AG",        "✓"),
+    "AS199218": ("Proton AG",        "✓"),
+    "AS208172": ("Proton AG",        "✓"),
+    "AS207951": ("Proton AG",        "✓"),
+    # Contracted partners
+    "AS9009":   ("M247 Europe",      "⚙"),
+    "AS51332":  ("M247 Ltd",         "⚙"),
+    "AS60068":  ("Datacamp/CDN77",   "⚙"),
+    "AS212238": ("Datacamp Ltd",     "⚙"),
+    "AS46562":  ("Performive",       "⚙"),
+    "AS63023":  ("GTHost",           "⚙"),
+    "AS49981":  ("Worldstream",      "⚙"),
+    "AS24875":  ("NovoServe",        "⚙"),
+    "AS35432":  ("Latitude.sh",      "⚙"),
+    "AS262287": ("Latitude.sh",      "⚙"),
+    "AS396356": ("Latitude.sh",      "⚙"),
+    "AS1257":   ("Tele2",            "⚙"),
+    "AS8473":   ("Bahnhof",          "⚙"),
+    "AS202053": ("Creanova",         "⚙"),
+    "AS20473":  ("Choopa/Vultr",     "⚙"),
+    "AS13335":  ("Cloudflare",       "⚙"),
+    "AS8452":   ("Telecom Egypt",    "⚙"),
+    "AS16247":  ("Akamai/Linode",    "⚙"),
+}
+
+# Well-known privacy-respecting public DNS resolvers (safe when inside Proton tunnel)
+KNOWN_SAFE_DNS_IPS = {
+    "1.1.1.1", "1.0.0.1",           # Cloudflare DNS  (AS13335 — Proton partner)
+    "9.9.9.9", "149.112.112.112",    # Quad9  (privacy-focused)
+}
 
 # ── ANSI ───────────────────────────────────────────────────────────────────────
 RST     = "\033[0m"
@@ -272,6 +340,50 @@ def check_wg(iface):
     return {"level": "ok", "msg": f"Tunnel alive — handshake {age} ago"}
 
 
+# ── WireGuard configuration validation ───────────────────────────────────────
+def check_wg_config(iface):
+    """
+    Parse `wg show <iface>` output to validate security configuration.
+    Checks: AllowedIPs (full-tunnel 0.0.0.0/0), persistent keepalive,
+    listening port.  Returns a dict with ok, warnings, and info lists.
+    """
+    result = {"ok": True, "warnings": [], "info": []}
+    try:
+        out = subprocess.check_output(
+            ["sudo", "wg", "show", iface],
+            text=True, stderr=subprocess.DEVNULL, timeout=5)
+    except FileNotFoundError:
+        result["warnings"].append("wg not found — install wireguard-tools")
+        return result
+    except Exception as e:
+        result["warnings"].append(f"Cannot read config: {e}")
+        return result
+
+    has_full_tunnel = False
+    for line in out.splitlines():
+        ls = line.strip().lower()
+        if ls.startswith("allowed ips:"):
+            ips = line.split(":", 1)[1].strip()
+            if "0.0.0.0/0" in ips:
+                has_full_tunnel = True
+                result["info"].append(f"AllowedIPs: {ips} (full-tunnel) ✓")
+            else:
+                result["warnings"].append(
+                    f"AllowedIPs may allow traffic bypass: {ips}")
+                result["ok"] = False
+        elif ls.startswith("persistent keepalive:"):
+            val = line.split(":", 1)[1].strip()
+            result["info"].append(f"Persistent keepalive: {val}")
+        elif ls.startswith("listening port:"):
+            val = line.split(":", 1)[1].strip()
+            result["info"].append(f"Listening port: {val}")
+
+    if not has_full_tunnel and result["ok"]:
+        result["warnings"].append(
+            "AllowedIPs 0.0.0.0/0 not confirmed — split-tunnel or config unreadable")
+    return result
+
+
 # ── Endpoint ping latency ──────────────────────────────────────────────────────
 def ping_wg_endpoint(iface):
     """Reads the WireGuard peer endpoint and pings it for round-trip latency."""
@@ -407,12 +519,13 @@ def check_proton(asn):
     """Classify exit ASN: Proton-owned / known partner / unknown."""
     if not asn:
         return {"level": "error", "msg": "ASN could not be determined"}
+    label, trust = ASN_LABELS.get(asn, (asn, "?"))
     if asn in PROTON_OWNED_ASN:
         return {"level": "owned",
-                "msg": "IP block owned directly by Proton AG ✓"}
+                "msg": f"IP block owned directly by Proton AG {trust}  [{label}]"}
     if asn in PROTON_PARTNER_ASN:
         return {"level": "partner",
-                "msg": "Known ProtonVPN DC partner (leased, Proton-controlled) ✓"}
+                "msg": f"Known ProtonVPN DC partner (Proton-controlled) {trust}  [{label}]"}
     return {"level": "unknown",
             "msg": f"NOT recognised as Proton or known partner ({asn})"}
 
@@ -527,7 +640,7 @@ def dns_all_safe(std, adv, vpn_asn):
 # ══════════════════════════════════════════════════════════════════════════════
 #  RENDER — Full detailed report
 # ══════════════════════════════════════════════════════════════════════════════
-def render_full(sys_info, wg, ping_r, routing, ks,
+def render_full(sys_info, wg, wg_config, ping_r, routing, ks,
                 ipv4, ipv6, ip_api_d, ipinf_d, ipwho_d,
                 proton, vpn_asn, std, adv):
 
@@ -571,6 +684,18 @@ def render_full(sys_info, wg, ping_r, routing, ks,
               f"latency {lat_c}{ping_r['latency_ms']} ms avg{RST}")
     else:
         print(f"  📡  {BOLD}Endpoint ping:{RST} {DIM}{ping_r['msg']}{RST}")
+
+    # ── WireGuard config validation
+    section("⚙️   WIREGUARD CONFIG VALIDATION")
+    if wg_config["info"]:
+        for line in wg_config["info"]:
+            print(f"  ✅  {GREEN}{line}{RST}")
+    if wg_config["warnings"]:
+        for line in wg_config["warnings"]:
+            c = YELLOW if "split-tunnel" in line.lower() or "unreadable" in line.lower() else RED
+            print(f"  ⚠️   {c}{line}{RST}")
+    if not wg_config["info"] and not wg_config["warnings"]:
+        print(f"  {DIM}No configuration data retrieved{RST}")
 
     # ── Routing & kill switch ──────────────────────────────────────────────────
     section("🛤   ROUTING & KILL SWITCH")
@@ -655,10 +780,12 @@ def render_full(sys_info, wg, ping_r, routing, ks,
             cc  = r.get("country_code","?")
             if is_proton_internal(ip):
                 tag = f"  {GREEN}← ProtonVPN internal tunnel DNS ✓{RST}"
+            elif ip in KNOWN_SAFE_DNS_IPS:
+                tag = f"  {GREEN}← known-safe public DNS ✓{RST}"
             elif vpn_asn in PROTON_OWNED_ASN | PROTON_PARTNER_ASN:
-                tag = f"  {GREEN}← Proton network{RST}"
+                tag = f"  {GREEN}← Proton network ✓{RST}"
             elif any(kw in isp.lower() for kw in PROTON_DNS_KW):
-                tag = f"  {GREEN}← Proton DNS{RST}"
+                tag = f"  {GREEN}← Proton DNS ✓{RST}"
             else:
                 tag = f"  {RED}← possible leak — not Proton DNS{RST}"
             print(f"      {DIM}→{RST}  {CYAN}{ip:<42}{RST}  {isp} [{cc}]{tag}")
@@ -677,7 +804,8 @@ def render_full(sys_info, wg, ping_r, routing, ks,
 #  RENDER — Compact live status (shown between full reports)
 # ══════════════════════════════════════════════════════════════════════════════
 def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
-                   proton, vpn_asn, std, adv, last_full_utc, next_full_in):
+                   proton, vpn_asn, std, adv, last_full_utc, next_full_in,
+                   location=""):
     """
     Single-screen status dashboard.
     Full-width boxed banner at the top — green, yellow, or red.
@@ -752,6 +880,10 @@ def render_compact(wg, ping_r, routing, ks, ipv4, ipv6,
           else "🟠" if proton["level"] == "partner" else "❌")
     print(f"  {pi}  {BOLD}{CYAN}{'ProtonVPN ASN':<20}{RST}  {pc}{proton['msg']}{RST}")
 
+    # Exit location
+    if location:
+        print(f"  📍  {BOLD}{CYAN}{'Location':<20}{RST}  {CYAN}{location}{RST}")
+
     # Default route
     r_ic  = "✅" if route_ok else "❌"
     r_c   = GREEN if route_ok else RED
@@ -790,9 +922,48 @@ def collect_all():
     proton   = check_proton(vpn_asn)
     std      = dns_standard()
     adv      = dns_advanced()
+    city     = (ip_api_d or {}).get("city", "")
+    cc       = (ip_api_d or {}).get("countryCode", "")
+    location = f"{city}, {cc}" if city and cc else ""
     return dict(ipv4=ipv4, ipv6=ipv6, ip_api_d=ip_api_d, ipinf_d=ipinf_d,
                 ipwho_d=ipwho_d, vpn_asn=vpn_asn, proton=proton,
-                std=std, adv=adv)
+                std=std, adv=adv, location=location)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Historical connection logging
+# ══════════════════════════════════════════════════════════════════════════════
+def log_connection(data, wg, proton, vpn_asn, std_status, adv_status):
+    """
+    Append a structured connection record to the JSON log file.
+    Keeps the last 1 000 records.  Silently skips if the file is unwritable.
+    Log location: ~/.local/share/protonwg-sentinel/connections.json
+    """
+    record = {
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "asn":          vpn_asn,
+        "provider":     ASN_LABELS.get(vpn_asn, (vpn_asn,))[0],
+        "proton_level": proton["level"],
+        "ip":           data.get("ipv4"),
+        "ipv6":         data.get("ipv6"),
+        "location":     data.get("location", ""),
+        "wg_status":    wg["level"],
+        "dns_standard": std_status,
+        "dns_advanced": adv_status,
+    }
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        records = []
+        if os.path.isfile(LOG_FILE):
+            with open(LOG_FILE, encoding="utf-8") as f:
+                records = json.load(f)
+        records.append(record)
+        if len(records) > 1000:
+            records = records[-1000:]
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            json.dump(records, f, indent=2)
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -826,14 +997,18 @@ def main():
     # ── Initial full data collection ───────────────────────────────────────────
     data          = collect_all()
     wg            = check_wg(INTERFACE)
+    wg_config     = check_wg_config(INTERFACE)
     ping_r        = ping_wg_endpoint(INTERFACE)
     routing       = check_routing(INTERFACE)
     ks            = check_killswitch()
     last_full_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     last_full_ts  = time.time()
+    log_connection(data, wg, data["proton"], data["vpn_asn"],
+                   assess_dns(data["std"], data["vpn_asn"])[0],
+                   assess_dns(data["adv"], data["vpn_asn"])[0])
 
     # ── Show first full report ─────────────────────────────────────────────────
-    render_full(sys_info, wg, ping_r, routing, ks,
+    render_full(sys_info, wg, wg_config, ping_r, routing, ks,
                 data["ipv4"], data["ipv6"],
                 data["ip_api_d"], data["ipinf_d"], data["ipwho_d"],
                 data["proton"], data["vpn_asn"],
@@ -860,13 +1035,17 @@ def main():
             print(f"\n  {BOLD}{CYAN}↻{RST}  {DIM}Re-fetching all network data…{RST}\n")
             data          = collect_all()
             wg            = check_wg(INTERFACE)
+            wg_config     = check_wg_config(INTERFACE)
             ping_r        = ping_wg_endpoint(INTERFACE)
             routing       = check_routing(INTERFACE)
             ks            = check_killswitch()
             last_full_utc = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
             last_full_ts  = time.time()
+            log_connection(data, wg, data["proton"], data["vpn_asn"],
+                           assess_dns(data["std"], data["vpn_asn"])[0],
+                           assess_dns(data["adv"], data["vpn_asn"])[0])
 
-            render_full(sys_info, wg, ping_r, routing, ks,
+            render_full(sys_info, wg, wg_config, ping_r, routing, ks,
                         data["ipv4"], data["ipv6"],
                         data["ip_api_d"], data["ipinf_d"], data["ipwho_d"],
                         data["proton"], data["vpn_asn"],
@@ -879,7 +1058,8 @@ def main():
                        data["ipv4"], data["ipv6"],
                        data["proton"], data["vpn_asn"],
                        data["std"], data["adv"],
-                       last_full_utc, next_full_in)
+                       last_full_utc, next_full_in,
+                       data.get("location", ""))
 
         time.sleep(COMPACT_INTERVAL)
 
