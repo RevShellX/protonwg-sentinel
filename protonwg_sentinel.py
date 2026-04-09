@@ -43,7 +43,7 @@ from typing import Optional
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 VERSION          = "8.0"
-INTERFACE        = "Sweden"   # WireGuard interface name  (check: sudo wg show)
+INTERFACE        = "wg0"      # WireGuard interface — auto-detected at startup via detect_wg_interface()
 STALE_WARN_SEC   = 150        # warn if handshake older than this (seconds)
 STALE_DEAD_SEC   = 300        # treat tunnel as dead beyond this
 COMPACT_INTERVAL = 5          # seconds between compact status refreshes
@@ -70,6 +70,8 @@ PROTON_OWNED_ASN = {
     "AS199218",   # Proton AG  (ProtonVPN-2 — newer infrastructure)
     "AS208172",   # Proton AG  (expansion network)
     "AS207951",   # Proton AG  (additional allocation)
+    "AS204779",   # Proton AG  (Swiss block — visible on bgp.tools)
+    "AS211984",   # Proton AG  (additional EU allocation)
 }
 
 # ⚙  PARTNER — contracted datacenter partners (leased, Proton-controlled)  (⚙ partner)
@@ -96,6 +98,8 @@ PROTON_PARTNER_ASN = {
     # Tele2 / Bahnhof — Scandinavia
     "AS1257",    # Tele2 AB               — Estonia / Scandinavia
     "AS8473",    # Bahnhof AB             — Sweden
+    # 31173 Services — Sweden
+    "AS39351",   # 31173 Services AB      — Sweden (confirmed ProtonVPN exit)
     # Creanova — Finland
     "AS202053",  # Creanova Oy            — Finland
     # Choopa / Vultr — global
@@ -106,6 +110,18 @@ PROTON_PARTNER_ASN = {
     "AS8452",    # Telecom Egypt          — Middle East
     # Akamai / Linode
     "AS16247",   # Akamai / Linode        — global content delivery
+    # Zenlayer — Asia Pacific
+    "AS21859",   # Zenlayer Inc.          — APAC / US (ProtonVPN Asia nodes)
+    # ColoCrossing — US
+    "AS36352",   # ColoCrossing LLC       — US (ProtonVPN US exit nodes)
+    # Hostinger — EU
+    "AS47583",   # Hostinger International — EU nodes
+    # IKOULA — France
+    "AS25003",   # IKOULA SAS             — France
+    # Serverius — Netherlands
+    "AS50673",   # Serverius              — Netherlands (AMS)
+    # Psychz Networks — US/APAC
+    "AS40676",   # Psychz Networks        — US / APAC
 }
 
 PROTON_DNS_KW = {"proton", "protonvpn", "proton.me", "proton.ch"}
@@ -127,6 +143,8 @@ ASN_LABELS = {
     "AS199218": ("Proton AG",        "✓"),
     "AS208172": ("Proton AG",        "✓"),
     "AS207951": ("Proton AG",        "✓"),
+    "AS204779": ("Proton AG",        "✓"),
+    "AS211984": ("Proton AG",        "✓"),
     # Contracted partners
     "AS9009":   ("M247 Europe",      "⚙"),
     "AS51332":  ("M247 Ltd",         "⚙"),
@@ -141,11 +159,18 @@ ASN_LABELS = {
     "AS396356": ("Latitude.sh",      "⚙"),
     "AS1257":   ("Tele2",            "⚙"),
     "AS8473":   ("Bahnhof",          "⚙"),
+    "AS39351":  ("31173 Services",   "⚙"),
     "AS202053": ("Creanova",         "⚙"),
     "AS20473":  ("Choopa/Vultr",     "⚙"),
     "AS13335":  ("Cloudflare",       "⚙"),
     "AS8452":   ("Telecom Egypt",    "⚙"),
     "AS16247":  ("Akamai/Linode",    "⚙"),
+    "AS21859":  ("Zenlayer",         "⚙"),
+    "AS36352":  ("ColoCrossing",     "⚙"),
+    "AS47583":  ("Hostinger",        "⚙"),
+    "AS25003":  ("IKOULA",           "⚙"),
+    "AS50673":  ("Serverius",        "⚙"),
+    "AS40676":  ("Psychz Networks",  "⚙"),
 }
 
 # Well-known privacy-respecting public DNS resolvers (safe when inside Proton tunnel)
@@ -493,6 +518,26 @@ def get_system():
         "arch":     platform.machine(),
         "python":   platform.python_version(),
     }
+
+
+# ── WireGuard interface auto-detection ────────────────────────────────────────
+def detect_wg_interface():
+    """
+    Detect the active WireGuard interface by running `sudo wg show interfaces`.
+    Returns the first interface found, or falls back to 'wg0' if none is active
+    or the command is unavailable.
+    """
+    try:
+        out = subprocess.check_output(
+            ["sudo", "wg", "show", "interfaces"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5)
+        ifaces = out.strip().split()
+        if ifaces:
+            return ifaces[0]
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired, PermissionError, OSError):
+        pass
+    return "wg0"
 
 
 # ── WireGuard handshake ────────────────────────────────────────────────────────
@@ -1182,12 +1227,15 @@ def log_connection(data, wg, proton, vpn_asn, std_status, adv_status):
 #  Main
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
-    global _running
+    global _running, INTERFACE
 
     signal.signal(signal.SIGINT,
                   lambda s, f: (print(f"\n{DIM}protonwg-sentinel stopped.{RST}\n"),
                                 sys.exit(0)))
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+
+    # Auto-detect the active WireGuard interface (overrides module-level default)
+    INTERFACE = detect_wg_interface()
 
     sys_info = get_system()
 
